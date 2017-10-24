@@ -195,10 +195,8 @@ else:
     from numpy.ma import MaskedArray    # noqa
 
 
-# Allow unique to return counts and
-# Added axis argument to numpy.unique
+# Allow unique to return counts and added axis argument
 # https://github.com/numpy/numpy/commit/1f764dbff7c496d6636dc0430f083ada9ff4e4be
-
 def unique(ar, return_index=False, return_inverse=False,
            return_counts=False, axis=None):
     ar = np.asanyarray(ar)

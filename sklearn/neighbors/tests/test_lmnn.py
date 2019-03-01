@@ -1,5 +1,14 @@
+# coding: utf-8
+"""
+Testing for Large Margin Nearest Neighbor module (sklearn.neighbors.lmnn)
+"""
+
+# Authors: John Chiotellis <johnyc.code@gmail.com>
+# License: BSD 3 clause
+
 import sys
 import numpy as np
+from scipy.optimize import check_grad
 
 from sklearn.utils.testing import assert_array_equal
 from sklearn.utils.testing import assert_array_almost_equal
@@ -12,12 +21,14 @@ from sklearn.utils.testing import assert_equal
 from sklearn import datasets
 from sklearn.neighbors import LargeMarginNearestNeighbor
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.neighbors.lmnn import _paired_distances_blockwise
-from sklearn.neighbors.lmnn import _euclidean_distances_without_checks
-from sklearn.metrics.pairwise import paired_euclidean_distances
-from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.neighbors.lmnn import (_paired_distances_blockwise,
+                                    _euclidean_distances_without_checks,
+                                    _compute_push_loss)
+from sklearn.metrics.pairwise import (paired_euclidean_distances,
+                                      euclidean_distances)
 from sklearn.model_selection import train_test_split
 from sklearn.utils.extmath import row_norms
+from sklearn.utils.validation import check_random_state
 from sklearn.externals.six.moves import cStringIO as StringIO
 from sklearn.exceptions import ConvergenceWarning
 
@@ -37,31 +48,37 @@ digits_target = digits.target[perm]
 
 
 def test_neighbors_iris():
-    # Sanity checks on the iris dataset
-    # Puts three points of each label in the plane and performs a
-    # nearest neighbor query on points near the decision boundary.
+    """Sanity check on the iris dataset
+
+    Puts three points of each label on the plane and performs a nearest
+    neighbor query on points near the decision boundary.
+
+    """
 
     lmnn = LargeMarginNearestNeighbor(n_neighbors=1)
     lmnn.fit(iris_data, iris_target)
     knn = KNeighborsClassifier(n_neighbors=lmnn.n_neighbors_)
-    LX = lmnn.transform(iris_data)
-    knn.fit(LX, iris_target)
-    y_pred = knn.predict(LX)
+    X_embedded = lmnn.transform(iris_data)
+    knn.fit(X_embedded, iris_target)
+    y_pred = knn.predict(X_embedded)
 
     assert_array_equal(y_pred, iris_target)
 
     lmnn.set_params(n_neighbors=9)
     lmnn.fit(iris_data, iris_target)
     knn = KNeighborsClassifier(n_neighbors=lmnn.n_neighbors_)
-    knn.fit(LX, iris_target)
+    knn.fit(X_embedded, iris_target)
 
-    assert knn.score(LX, iris_target) > 0.95
+    assert knn.score(X_embedded, iris_target) > 0.95
 
 
 def test_neighbors_digits():
-    # Sanity check on the digits dataset
-    # the 'brute' algorithm has been observed to fail if the input
-    # dtype is uint8 due to overflow in distance calculations.
+    """Sanity check on the digits dataset
+
+    The 'brute' algorithm for nearest neighbors has been observed to fail if
+    the inputs data type is uint8 due to overflow in distance calculations.
+
+    """
 
     X = digits_data.astype('uint8')
     y = digits_target
@@ -85,7 +102,8 @@ def test_neighbors_digits():
 
 
 def test_params_validation():
-    # Test that invalid parameters raise value error
+    # Test that invalid parameters raise appropriate errors
+
     X = np.arange(12).reshape(4, 3)
     y = [1, 1, 2, 2]
     LMNN = LargeMarginNearestNeighbor
@@ -284,8 +302,13 @@ def test_warm_start_validation():
 
 
 def test_warm_start_effectiveness():
-    # A 1-iteration second fit on same data should give almost same result
-    # with warm starting, and quite different result without warm starting.
+    """Test that fitting with warm start is better than without
+
+    After a first call to fit, we train again for 1 iteration on the same data.
+    Training with warm start enabled should not change the solution much, while
+    training from scratch (without warm start) should change it significantly.
+
+    """
 
     X, y = datasets.make_classification(n_samples=30, n_features=5,
                                         n_redundant=0, random_state=0)
@@ -521,7 +544,6 @@ def test_singleton_class():
 
 
 def test_convergence_warning():
-
     lmnn = LargeMarginNearestNeighbor(n_neighbors=3, max_iter=2, verbose=1)
     cls_name = lmnn.__class__.__name__
     assert_warns_message(ConvergenceWarning,
@@ -557,3 +579,94 @@ def test_euclidean_distances_without_checks():
     distances2 = _euclidean_distances_without_checks(X, X_norm_squared=XX)
 
     assert_array_equal(distances1, distances2)
+
+
+def test_find_impostors():
+    """Test if the impostors found are correct
+
+    Create data points for class A as the 4 corners of the unit square .
+    Impose a common margin radius = m for all points. This means that data
+    points with distance larger than m + sqrt(2) from the origin cannot be
+    impostors. Create data points for class B by shifting the points of class
+    A, m units along the x-axis. Thereby, half of the points in A must be
+    impostors to half of the points in B and vice versa.
+
+    The difference of using a sparse or dense data structure for the impostors
+    storage is tested in test_impostor_store().
+    """
+
+    margin = 4.
+    X_a = np.array([[-1., 1], [-1., -1.], [1., 1.], [1., -1.]])
+    X_b = X_a + np.array([(margin + np.sqrt(2))/2, 0])
+    X = np.concatenate((X_a, X_b))
+    y = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    lmnn = LargeMarginNearestNeighbor()
+    lmnn.random_state_ = check_random_state(0)
+
+    n_samples = X.shape[0]
+    classes = np.unique(y)
+
+    margin_radii = margin * np.ones(n_samples)
+    groundtruth_pairs = {(0, 4), (1, 5), (2, 4), (2, 6), (3, 5), (3, 7),
+                         (4, 0), (5, 1), (4, 2), (6, 2), (5, 3), (7, 3)}
+
+    impostors_graph = lmnn._find_impostors(X, y, classes, margin_radii)
+
+    imp_row = impostors_graph.row
+    imp_col = impostors_graph.col
+    # dist_impostors = impostors_graph.data
+
+
+def test_compute_push_loss():
+    """Test if the push loss is computed correctly"""
+
+    X, y = datasets.make_classification()
+    classes = np.unique(y)
+    lmnn = LargeMarginNearestNeighbor()
+    lmnn.n_neighbors_ = lmnn.n_neighbors
+    target_neighbors = lmnn._select_target_neighbors_wrapper(X, y, classes)
+    grad_static = lmnn._compute_grad_static(X, target_neighbors)
+
+    # Compute (squared) distances to the target neighbors
+    n_neighbors = target_neighbors.shape[1]
+    dist_tn = np.zeros((X.shape[0], n_neighbors))
+    for k in range(n_neighbors):
+        dist_tn[:, k] = row_norms(X - X[target_neighbors[:, k]], squared=True)
+    impostors_graph = lmnn._find_impostors(X, y, classes, dist_tn[:, -1])
+
+    loss, grad, _ = _compute_push_loss(X, target_neighbors, dist_tn,
+                                       impostors_graph)
+
+
+def test_loss_grad_lbfgs():
+    """Test gradient of loss function
+
+    Assert that the gradient is almost equal to its finite differences
+    approximation.
+    """
+
+    X, y = datasets.make_classification()
+    classes = np.unique(y)
+    L = rng.randn(rng.randint(1, X.shape[1] + 1), X.shape[1])
+    lmnn = LargeMarginNearestNeighbor()
+    lmnn.n_neighbors_ = lmnn.n_neighbors
+    lmnn.n_iter_ = 0
+    target_neighbors = lmnn._select_target_neighbors_wrapper(X, y, classes)
+    grad_static = lmnn._compute_grad_static(X, target_neighbors)
+
+    kwargs = {
+        'classes':classes,
+        'target_neighbors': target_neighbors,
+        'grad_static':grad_static,
+        'use_sparse':False
+    }
+
+    def fun(L):
+        return lmnn._loss_grad_lbfgs(L, X, y, **kwargs)[0]
+
+    def grad(L):
+        return lmnn._loss_grad_lbfgs(L, X, y, **kwargs)[1]
+
+    # compute relative error
+    rel_diff = check_grad(fun, grad, L.ravel()) / np.linalg.norm(grad(L))
+    np.testing.assert_almost_equal(rel_diff, 0., decimal=5)
